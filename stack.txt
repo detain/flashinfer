@@ -1,0 +1,257 @@
+# stack.txt -- flashinfer stack for the QSA paged index-K scorer (sglang Qwen3.8-Flash-Next)
+#
+# STACK: main+pr4899
+#
+# branch : stack-4899-core
+# tip    : 7337a7b4  (last code commit; the manifest commit sits above it)
+# base   : upstream flashinfer-ai/flashinfer main @ aa7c67f2
+#          ("feat(moe_ep): MXFP8 x BF16 integration (#4604)")
+# fork   : https://github.com/detain/flashinfer  (origin)
+# updated: 2026-09-17 (first cut -- #4899 cherry-picked forward onto current main)
+#
+# WHY THIS STACK EXISTS
+#
+# sglang's QSA (Qwen Sparse Attention) index-K scoring currently packs the
+# compressed-K rows into a contiguous ragged buffer before scoring them, with a
+# fused packer kernel, a per-forward scratch buffer and a host readback to size
+# it. flashinfer PR #4899 adds a scorer that reads the PAGED compressed-K cache
+# directly, which makes that packing unnecessary.
+#
+# The sglang-side integration is NOT built. It is planned in
+#   /root/sglang/sglang.prev/plan_flashinfer_paged_index_k_scorer.md
+# and is gated on #4899 landing in a flashinfer RELEASE. This stack exists so
+# the scorer can be developed and tested against locally before that happens.
+#
+# IMPORTANT: #4899 is OPEN upstream, not merged. It is cherry-picked with
+# `git cherry-pick -x`, so each commit carries its origin hash.
+
+==============================================================================
+STACK, IN BUILD ORDER (bottom first)
+==============================================================================
+
+  PR #4899  [open]  @lesj0610
+      https://github.com/flashinfer-ai/flashinfer/pull/4899
+      feat(attention): score a paged KV cache against a multi-head query
+      upstream head at pick time: 4df875785926d56fa477e918eb79133f3e90d9d2
+      (15 commits, 2026-09-01..2026-09-03; unchanged upstream since 2026-09-11)
+         1. 1ebd790e  feat(attention): score a paged KV cache against a multi-head query
+         2. d1f2f5dc  fix(sparse): gate the scorer per device, and bound the count it reports
+         3. d9a53486  test(sparse): check the scorer against a torch reference, not against itself
+         4. f5f185cb  test(sparse): pin that a row does not write past its own count
+         5. 1a78d0cf  fix(aot): build the scorer for every SM8-or-newer target
+         6. 8ee948e6  test(sparse): pin the AOT gate to the target arch list
+         7. 7968cb19  perf(attention): resolve the scorer's addresses once and cache its keys in L1
+         8. df5ad7ed  perf(attention): turn the scorer's launch over at four waves, not one
+         9. a9553aa2  perf(attention): pick the scorer's launch by blocks per SM, not by waves
+        10. bbbcb874  bench(attention): time the sparse paged scorer
+        11. ad6eff3b  fix(sparse): refuse a page that holds nothing, and format the headers
+        12. e953e5e2  fix(sparse): bound an index in its own width before narrowing it
+        13. 965dfd11  fix(sparse): compute the query end outside the width that overflows
+        14. dff352f5  test(sparse): fail without the compression ratio's upper bound
+        15. 7337a7b4  fix(sparse): check what the scorer's per-row indices are, and say what failed
+
+  # The PR branched off d4d1e862 ("fix: preserve both generated-source
+  # pre-commit exclusions (#5113)"), which was 111 commits behind main at pick
+  # time. All 15 commits cherry-picked onto aa7c67f2 with ZERO conflicts:
+  # 10 of the 12 touched files are new or untouched on main, and the two that
+  # did move (flashinfer/__init__.py, flashinfer/aot.py) take small additive
+  # edits that did not overlap main's changes.
+  #
+  # Post-pick fidelity check: `git diff pr4899 stack-4899-core -- <touched>`
+  # shows ONLY main's own drift in flashinfer/__init__.py (main dropped
+  # BatchDecodeMlaWithPagedKVCacheWrapper and added
+  # launch_sm110_gqa_decode_prepared). No #4899 content was lost.
+
+==============================================================================
+WHAT IT ADDS
+==============================================================================
+
+  flashinfer.sparse_paged_scores(
+      q,                    # [rows, num_heads<=16, head_dim] bf16|fp16
+                            #   head_dim in {64,128,192,256}
+      k_cache,              # [pages, page_size, head_dim], SAME dtype as q
+                            #   note: NO kv-heads dimension
+      page_table,           # [num_requests, width]; NEGATIVE entry = unmapped,
+                            #   which scores as -inf
+      token_to_req,         # [rows]; NEGATIVE = empty (masked) query row
+      query_positions,      # [rows] int32, position of each query in its request
+      sequence_lengths,     # [num_requests] int32
+      compress_ratio,       # a query scores only entries FULLY behind it:
+                            #   visible = (pos + 1) // ratio
+      divisor,              # score scale (sglang passes sqrt(head_dim))
+      num_columns=None,     # optional column cap
+      logits=None,          # caller-provided fp32 [rows, width*page_size]
+      visible_blocks=None,  # caller-provided per-row scored count
+  ) -> (logits, visible_blocks)
+
+  Score function: logits[r,c] = sum_h max(0, dot(K[c], Q[r,h])) / divisor
+  -- exactly sglang's QSA relu-MQA logits.
+
+  Files added/changed by the PR:
+    csrc/sparse_scores.cu                          (new, 137)
+    csrc/sparse_scores_jit_binding.cu              (new,  23)
+    include/flashinfer/attention/sparse_scores.cuh (new, 599)
+    flashinfer/sparse_scores.py                    (new, 229)
+    flashinfer/jit/sparse_scores.py                (new,  31)
+    tests/attention/test_sparse_scores.py          (new, 470)
+    tests/jit/test_sparse_scores_jit.py            (new, 101)
+    benchmarks/bench_sparse_paged_scores.py        (new, 142)
+    include/flashinfer/cp_async.cuh                (mod, +128/-35)
+    include/flashinfer/mma.cuh                     (mod,  +67)
+    flashinfer/__init__.py                         (mod,   +1)
+    flashinfer/aot.py                              (mod,  +11)
+
+  Capability gate: the kernel multiplies with PTX m16n8k16, so sm_80+.
+  Enforced per DEVICE (not per process) at flashinfer/sparse_scores.py:31,
+  _SPARSE_SCORES_MIN_CAPABILITY = (8, 0).
+
+==============================================================================
+INSTALL (isolated -- does NOT touch the live server's flashinfer)
+==============================================================================
+
+  The production sglang venv (/root/sglang/.venv) keeps flashinfer 0.6.18,
+  which is what the running server imports. This stack is 0.7.0-dev and is
+  installed in a SEPARATE venv that overlays the production one read-only:
+
+    python -m venv /root/sglang/.venv-fi4899
+    SP=/root/sglang/.venv-fi4899/lib/python3.12/site-packages
+    # dev tree FIRST, production site-packages LAST (deps only)
+    echo /root/sglang/flashinfer                              > $SP/00_flashinfer_dev.pth
+    echo /root/sglang/.venv/lib/python3.12/site-packages      > $SP/zz_overlay_prod.pth
+    /root/sglang/.venv-fi4899/bin/python -m pip install \
+        -e /root/sglang/flashinfer --no-deps --no-build-isolation
+
+  BUILD_NVEP=0 BUILD_NIXL_EP=0 BUILD_NCCL_EP=0 FLASHINFER_AOT=0 were set; the
+  moe_ep/NIXL native build is irrelevant to the scorer and nccl-extensions is
+  not installed in the production venv.
+
+  WHY THE TWO .pth FILES ARE ORDERED THAT WAY -- setuptools APPENDS its
+  editable finder to sys.meta_path, so it runs AFTER the default path finder.
+  With only the overlay .pth, the default finder resolved the top-level
+  `flashinfer` package to the production 0.6.18 directory while the editable
+  finder still served `flashinfer.sparse_scores` from this tree -- a 0.6.18
+  package with 0.7.0 submodules grafted on. 00_flashinfer_dev.pth sorts first
+  and puts this tree ahead of production on sys.path, so the whole package
+  resolves consistently from here. If you rebuild the venv, keep that order.
+
+  Verify:
+    /root/sglang/.venv-fi4899/bin/python -c \
+      "import flashinfer; print(flashinfer.__version__, flashinfer.__file__, \
+       hasattr(flashinfer,'sparse_paged_scores'))"
+    # -> 0.7.0 /root/sglang/flashinfer/flashinfer/__init__.py True
+    /root/sglang/.venv/bin/python -c \
+      "import flashinfer; print(flashinfer.__version__, \
+       hasattr(flashinfer,'sparse_paged_scores'))"
+    # -> 0.6.18 False      (production venv, must stay this way)
+
+  RUN BOTH FROM A NEUTRAL DIRECTORY (e.g. cd /root). Python puts the cwd on
+  sys.path[0], and /root/sglang/flashinfer contains a real `flashinfer/`
+  package, so running the checks from the repo root makes the PRODUCTION venv
+  report 0.7.0 with the scorer present -- which looks exactly like the thing
+  this isolation is meant to prevent. It is an artifact of the cwd, not a
+  contaminated venv. The authoritative on-disk check is:
+    ls -d /root/sglang/.venv/lib/python3.12/site-packages/flashinfer_python-*.dist-info
+    # -> flashinfer_python-0.6.18.dist-info
+
+==============================================================================
+VERIFICATION STATUS
+==============================================================================
+
+  RUN AND PASSING
+  * tests/jit/test_sparse_scores_jit.py -- 7 passed.
+    The AOT-gate suite. Fully monkeypatched (it stubs gen_sparse_scores_module,
+    gen_attention, gen_cudnn_fmha_module), so it compiles nothing and allocates
+    nothing: free VRAM on the test device was 6126 MiB before and after.
+    NOTE it needs a VISIBLE device anyway -- with CUDA_VISIBLE_DEVICES="" all 6
+    parametrized cases fail in flashinfer/compilation_context.py:142
+    ("No supported CUDA architectures found"), because the GLOBAL compilation
+    context is built at import, before the test's monkeypatch applies. That is
+    an environment artifact, not a defect.
+  * ruff check + ruff format --diff over all 7 changed Python files -- clean.
+    Ruff 0.16.8; .pre-commit-config.yaml pins 0.12.8, so the repo's own hook
+    may differ. pre-commit itself is not installed here and was not run, so
+    clang-format / mypy / codespell are UNVERIFIED.
+  * API probe: flashinfer.sparse_paged_scores exists and its signature matches
+    all 11 documented parameters, in order. Baseline before install (0.6.18)
+    reported False, as expected.
+  * CUDA BUILD: the scorer JIT-compiles CLEANLY for sm_120f in 11.6s --
+      gen_sparse_scores_module().build_and_load()
+    with nvcc 12.9, -gencode arch=compute_120f,code=sm_120f, against this
+    tree's headers. This is the check that matters most for a 111-commit
+    forward-port: csrc/sparse_scores.cu, the 599-line sparse_scores.cuh, and
+    the PR's edits to cp_async.cuh / mma.cuh all compile against current main.
+    It does NOT say the kernel is CORRECT -- nothing was executed.
+
+  NOT RUN
+  * tests/attention/test_sparse_scores.py -- 70 tests COLLECT cleanly on CPU
+    but were NOT executed: they need a GPU, and all four cards are held by the
+    live server (~92 GB of 97.9 GB each, ~6 GB free). Deliberate decision, not
+    a failure. This is the suite that actually exercises the kernel, including
+    the torch-reference parity test (commit 3, d9a53486). NOTHING HERE HAS BEEN
+    NUMERICALLY VALIDATED.
+  * benchmarks/bench_sparse_paged_scores.py -- not run (same reason).
+  * The upstream PR's own CI claims 73 passed on SM80 / CUDA 13.0. SM120
+    correctness is UNVERIFIED upstream and unverified here.
+
+==============================================================================
+KNOWN GAPS AND TRAPS
+==============================================================================
+
+  * SUBMODULES WERE NOT INITIALIZED in this clone (now FIXED, see below).
+    3rdparty/{cccl,cutlass,spdlog,nixl} were all empty, so the first JIT
+    compile of the scorer failed in include/flashinfer/fastdiv.cuh:39 on
+    `cuda::fast_mod_div<uint32_t>` -- the build had fallen back to CUDA 12.9's
+    bundled libcu++, which does not have it. fastdiv.cuh is byte-identical to
+    upstream/main and is NOT touched by #4899, so this was a checkout-setup
+    problem, not a PR defect.
+    Resolved by initializing cccl, cutlass and spdlog at their pinned SHAs
+    (16bd510c / b46b16d0 / c3aed4b6). nixl is still empty -- it is the
+    moe_ep transport and is not needed for the scorer.
+    TRAP: `git submodule update --init --depth 1` does NOT work here. A shallow
+    clone cannot reach the pinned commits, and it leaves a shallow repo behind
+    that makes every later attempt fail the same way ("Fetched in submodule
+    path ..., but it did not contain <sha>"). Recovering needs an explicit
+    `git -C .git/modules/3rdparty/<name> fetch --unshallow` first. Clone full.
+  * Local nvcc is 12.9; the repo's ci/cuda-versions.json carries both cu129 and
+    cu13x runtimes, and the venv's torch is 2.13.0+cu130. Mixed-major setups
+    are a known source of libcudart conflicts (requirements.txt says so at
+    length). Treat any build result here as specific to this machine.
+  * `flashinfer.sparse` is a real MODULE in 0.6.18. An availability probe of
+    the form `importlib.import_module("flashinfer.sparse.scores")` therefore
+    fails on every version and proves nothing. The wrapper is
+    flashinfer/sparse_scores.py (top level), and the correct probe is
+    `hasattr(flashinfer, "sparse_paged_scores")`.
+  * Untouched columns in a caller-provided `logits` buffer are NOT set to -inf;
+    an auto-allocated buffer is torch.empty. Consumers must bound themselves by
+    the returned `visible_blocks`.
+  * #4899 takes fp16/bf16 operands only. sglang's fp8 indexer path cannot use
+    it and must keep its existing scorer.
+  * Companion PRs #4897 (pre-indexer), #4898 (route kernels) and #4900 (NVFP4
+    block-sparse) are all still OPEN and are NOT in this stack. #4899 does not
+    depend on them -- it branched off plain main, not off #4897.
+
+==============================================================================
+REBUILDING FROM SCRATCH
+==============================================================================
+
+  git remote add upstream https://github.com/flashinfer-ai/flashinfer.git
+  git fetch upstream
+  git checkout -B stack-4899-core aa7c67f2          # or a newer upstream main
+  git fetch upstream pull/4899/head:pr4899          # re-pull: PR is open, head may move
+  git cherry-pick -x $(git rev-list --reverse \
+      $(git merge-base pr4899 upstream/main)..pr4899)
+  git submodule update --init 3rdparty/cccl 3rdparty/cutlass 3rdparty/spdlog
+
+  If the PR head has moved, re-derive the commit list rather than trusting the
+  hashes above; they are this pick's hashes, not upstream's.
+
+==============================================================================
+UPSTREAM WATCH
+==============================================================================
+
+  gh api repos/flashinfer-ai/flashinfer/pulls/4899 \
+     --jq '{state,merged,mergeable_state,head:.head.sha,updated:.updated_at}'
+
+  When it merges, the sglang-side plan's Phase 1 unblocks. Re-check the
+  signature against the block under WHAT IT ADDS above -- the argument names
+  churned during review, and the merged source is the truth, not this file.
